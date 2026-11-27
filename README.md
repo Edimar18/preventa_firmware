@@ -67,3 +67,15 @@ Before activation the normal local sensor pipeline, LEDs, buzzer, camera preview
 After activation, the saved configuration permits SMS/local monitoring through a Wi-Fi outage. Explicit server authentication refusal disables cloud/SMS authorization; an ordinary network timeout does not erase an already verified activation. A Wi-Fi reset preserves owner configuration. Flashing a different provisioned device identity clears stale Wi-Fi and owner cache once; firmware upgrades with the same identity keep them. Device identity comes from the provisioned firmware rather than old NVS credential overrides.
 
 SMS includes the alert tier, installed room and hardware ID. AP test messages remain clearly marked TEST. Reopening setup on an unclaimed device generates a fresh pairing code. Room changes are fetched at the normal settings interval after activation. The current release does not implement owner transfer; clearing Wi-Fi is not an ownership-release operation.
+
+## AP camera preview and sensor reset (2026-11-27)
+
+Flash both updated boards together. AP preview now uses `PREVIEW:<request_id>` and returns a matching 96x96 BMP, prediction scores and a checked end marker. It does not wait for an extra full-frame JPEG. Normal live/autonomous JPEG capture uploads remain supported. The model, preprocessing and tier thresholds are unchanged.
+
+The main UART RX buffer is 32 KiB. A request has a fixed 45-second deadline and a binary transfer fails after 10 seconds without progress. Text framing is bounded, and interrupted or stale replies cannot complete a different preview. Browser requests time out rather than keeping the capture button locked. Sensor faults/null values do not break preview telemetry.
+
+The AP button **Recalibrate ESP32-CAM** restarts the sensor, reapplies its existing settings and settles auto exposure/gain/white balance. It does not retrain or replace the model. Clear a Tier 3+ test or resolve a real warning before recalibration. These local controls work before owner activation and without home Wi-Fi.
+
+Idle link checks repeat every 10 seconds. The AP distinguishes no valid UART reply from camera sensor/model failure and shows received-byte counts. A flash proves that the camera received a command; it does not prove that a reply reached the main board. If received bytes stay at zero, remove power before checking CAM GPIO1/TX to main GPIO21/RX, main GPIO22/TX to CAM GPIO3/RX, and common ground.
+
+Validation: eight host tests plus AP JavaScript regression checks pass; both board builds compile with ESP32 core 2.0.17. Physical capture still requires checking on the actual boards.

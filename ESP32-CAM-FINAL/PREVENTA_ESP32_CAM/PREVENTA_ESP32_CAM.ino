@@ -48,6 +48,7 @@
 
 // Generated model array
 #include "model.h"
+#include "camera_transport.h"
 
 #define CAMERA_MODEL_AI_THINKER
 
@@ -128,6 +129,7 @@ static camera_config_t camera_config = {
 
 unsigned long g_last_auto_capture_ms = 0;
 bool g_cam_initialized = false;
+bool g_camera_sensor_ready = false;
 bool g_inference_running = false;
 bool g_standby_mode = false;
 
@@ -349,14 +351,123 @@ void captureAndSend(bool autonomous, bool includeModelInput) {
     g_inference_running = false;
 }
 
+bool initializeCameraSensor() {
+    if (g_camera_sensor_ready) esp_camera_deinit();
+    g_camera_sensor_ready = false;
+    camera_config.xclk_freq_hz = 20000000;
+    camera_config.pixel_format = PIXFORMAT_JPEG;
+    esp_err_t err = esp_camera_init(&camera_config);
+    if (err != ESP_OK) {
+        camera_config.xclk_freq_hz = 10000000;
+        camera_config.pixel_format = PIXFORMAT_RGB565;
+        err = esp_camera_init(&camera_config);
+    }
+    if (err != ESP_OK) return false;
+    g_camera_sensor_ready = true;
+    sensor_t* s = esp_camera_sensor_get();
+    if (!s) { esp_camera_deinit(); g_camera_sensor_ready = false; return false; }
+    // Preserve the established orientation, crop, color tuning and auto controls.
+    s->set_vflip(s, 0);
+    s->set_hmirror(s, 1);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 1);
+    s->set_saturation(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);
+    s->set_gain_ctrl(s, 1);
+    s->set_gainceiling(s, (gainceiling_t)2);
+    s->set_bpc(s, 1);
+    s->set_wpc(s, 1);
+    s->set_lenc(s, 1);
+    return true;
+}
+
+bool settleCameraSensor() {
+    const unsigned long started = millis();
+    int frames = 0;
+    while (frames < 6 && millis() - started < 8000UL) {
+        camera_fb_t* frame = esp_camera_fb_get();
+        if (!frame) return false;
+        esp_camera_fb_return(frame);
+        ++frames;
+        delay(60);
+    }
+    return frames == 6;
+}
+
+void captureSetupPreview(uint32_t requestId) {
+    Serial.printf("\nCAPTURE_BEGIN:%lu\n", static_cast<unsigned long>(requestId));
+    if (!g_cam_initialized || g_inference_running) {
+        Serial.printf("CAPTURE_ERROR:%lu,camera_unavailable\n", static_cast<unsigned long>(requestId));
+        return;
+    }
+    g_inference_running = true;
+    flashPulseOn();
+    camera_fb_t* frame = captureFreshFrame();
+    flashPulseOff();
+    uint8_t* preview = frame ? static_cast<uint8_t*>(ps_malloc(kModelInputBmpBytes)) : nullptr;
+    float fire = 0, noFire = 0;
+    const bool predicted = frame && preview && runInference(frame, fire, noFire, preview);
+    if (predicted) {
+        Serial.printf("PREDICT:%d,%d\nMODEL_INPUT:%u\n", int(fire * 100.0f), int(noFire * 100.0f), static_cast<unsigned>(kModelInputBmpBytes));
+        Serial.write(preview, kModelInputBmpBytes);
+        Serial.printf("\nCAPTURE_END:%lu,%lu\n", static_cast<unsigned long>(requestId),
+                      static_cast<unsigned long>(preventa::cameraPreviewChecksum(preview, kModelInputBmpBytes)));
+    } else {
+        const char* reason = !frame ? "capture" : !preview ? "preview_memory" : "inference";
+        Serial.printf("CAPTURE_ERROR:%lu,%s\n", static_cast<unsigned long>(requestId), reason);
+    }
+    Serial.flush();
+    free(preview);
+    if (frame) esp_camera_fb_return(frame);
+    g_inference_running = false;
+    g_last_auto_capture_ms = millis();
+}
+
+void recalibrateCameraSensor(uint32_t requestId) {
+    Serial.printf("\nCAM_RECALIBRATE_BEGIN:%lu\n", static_cast<unsigned long>(requestId));
+    if (!interpreter || !input || !output || g_inference_running) {
+        Serial.printf("CAM_RECALIBRATED:%lu,ERROR:model_unavailable_or_busy\n", static_cast<unsigned long>(requestId));
+        Serial.flush();
+        return;
+    }
+    g_inference_running = true;
+    g_cam_initialized = false;
+    flashPulseOff();
+    const bool ready = initializeCameraSensor() && settleCameraSensor();
+    g_cam_initialized = ready;
+    g_inference_running = false;
+    g_last_auto_capture_ms = millis();
+    Serial.printf("CAM_RECALIBRATED:%lu,%s\n", static_cast<unsigned long>(requestId), ready ? "OK" : "ERROR:sensor_restart_or_frames");
+    Serial.flush();
+}
+
+bool cameraCommandId(const char* text, uint32_t& value) {
+    if (text[0] < '0' || text[0] > '9') return false;
+    char* end = nullptr;
+    const unsigned long id = strtoul(text, &end, 10);
+    if (!end || *end || !id || id > UINT32_MAX) return false;
+    value = static_cast<uint32_t>(id);
+    return true;
+}
+
 // ============================================================================
 // Command Dispatcher
 // ============================================================================
 void handleCommand(const char* cmd) {
     static bool modelInputRequested = false;
     static unsigned long modelInputRequestedAt = 0;
-    if (strcmp(cmd, "PING") == 0) {
+    uint32_t requestId = 0;
+    if (strncmp(cmd, "PREVIEW:", 8) == 0 && cameraCommandId(cmd + 8, requestId)) {
+        captureSetupPreview(requestId);
+    } else if (strncmp(cmd, "CAM_RECALIBRATE:", 16) == 0 && cameraCommandId(cmd + 16, requestId)) {
+        recalibrateCameraSensor(requestId);
+    } else if (strcmp(cmd, "PING") == 0) {
         Serial.println("PONG");
+        Serial.printf("STATUS:%s,PSRAM:%u,STBY:%d\n", g_cam_initialized ? "OK" : "ERR", ESP.getFreePsram(), g_standby_mode ? 1 : 0);
         Serial.flush();
     } else if (strcmp(cmd, "MODEL_INPUT_ONCE") == 0) {
         modelInputRequested = true;
@@ -404,51 +515,13 @@ void setup() {
         digitalWrite(FLASH_GPIO_NUM, LOW);
     }
 
-    // Prefer the OV2640's native JPEG path. Older camera modules can use RGB565.
-    esp_err_t err = esp_camera_init(&camera_config);
-    if (err != ESP_OK) {
-        camera_config.xclk_freq_hz = 10000000;
-        camera_config.pixel_format = PIXFORMAT_RGB565;
-        err = esp_camera_init(&camera_config);
-    }
-    if (err != ESP_OK) {
-        Serial.printf("CAM_READY:0\n");
-        return;
-    }
-
-    sensor_t* s = esp_camera_sensor_get();
-    if (!s) {
+    if (!initializeCameraSensor() || !settleCameraSensor()) {
         Serial.println("CAM_READY:0");
         return;
     }
-    Serial.printf("CAM_SENSOR:0x%04X,FORMAT:%s\n", static_cast<unsigned>(s->id.PID),
+    sensor_t* sensor = esp_camera_sensor_get();
+    Serial.printf("CAM_SENSOR:0x%04X,FORMAT:%s\n", static_cast<unsigned>(sensor->id.PID),
                   camera_config.pixel_format == PIXFORMAT_JPEG ? "JPEG" : "RGB565");
-    s->set_vflip(s, 0);     // 0 = upright (fixes upside-down photo)
-    s->set_hmirror(s, 1);   // Keep mirror setting
-
-    // Hardware sensor tuning for enhanced image quality
-    s->set_brightness(s, 0);     // -2 to 2
-    s->set_contrast(s, 1);       // -2 to 2 (slight contrast enhancement)
-    s->set_saturation(s, 0);     // -2 to 2
-    s->set_whitebal(s, 1);       // Enable Auto White Balance
-    s->set_awb_gain(s, 1);       // Enable AWB Gain
-    s->set_wb_mode(s, 0);        // 0 = Auto WB
-    s->set_exposure_ctrl(s, 1);  // Enable AEC
-    s->set_aec2(s, 1);           // Enable DSP Auto Exposure
-    s->set_gain_ctrl(s, 1);      // Enable AGC
-    s->set_gainceiling(s, (gainceiling_t)2); // Limit high gain noise
-    s->set_bpc(s, 1);            // Black pixel correction
-    s->set_wpc(s, 1);            // White pixel correction
-    s->set_lenc(s, 1);           // Lens correction
-
-    // Pre-flush 4 dummy frames to let AGC & AEC stabilize (prevents black first capture)
-    for (int i = 0; i < 4; i++) {
-        camera_fb_t* dummy_fb = esp_camera_fb_get();
-        if (dummy_fb) {
-            esp_camera_fb_return(dummy_fb);
-        }
-        delay(60);
-    }
 
     // 2. Allocate PSRAM Tensor Arena
     if (psramFound()) {

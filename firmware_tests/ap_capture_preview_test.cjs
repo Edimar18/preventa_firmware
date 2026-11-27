@@ -15,7 +15,8 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 async function settle() { await tick(); await tick(); }
 
 function browser() {
-  const elements = new Map(), requests = [], alerts = [];
+  const elements = new Map(), requests = [], alerts = [], timers = new Map();
+  let timerId = 0, now = 1000;
   function element(id) {
     if (!elements.has(id)) elements.set(id, {
       dataset: {}, style: {}, parentElement: {hidden: true}, hidden: true,
@@ -25,11 +26,17 @@ function browser() {
     return elements.get(id);
   }
   const ctx = {
-    document: {getElementById: element}, setInterval() {}, setTimeout() {},
+    document: {getElementById: element}, setInterval() {},
+    setTimeout(fn, delay) { const id = ++timerId; timers.set(id, {fn, delay}); return id; },
+    clearTimeout(id) { timers.delete(id); }, AbortController,
+    Date: class extends Date { static now() { return now; } },
     alert: message => alerts.push(message), confirm: () => true,
     URLSearchParams,
     fetch(url, options) {
-      return new Promise((resolve, reject) => requests.push({url, options, resolve, reject}));
+      return new Promise((resolve, reject) => {
+        requests.push({url, options, resolve, reject});
+        options?.signal?.addEventListener('abort', () => reject(new Error('aborted')));
+      });
     },
   };
   vm.createContext(ctx); vm.runInContext(script, ctx);
@@ -44,7 +51,9 @@ function browser() {
     test_sms: 'idle', test_push: 'idle',
   });
   const loadImages = () => element('setup_model_input').onload?.();
-  return {ctx, element, requests, alerts, respond, data, loadImages};
+  const advance = ms => { now += ms; };
+  const expireRequests = () => { for (const [id, timer] of [...timers]) if (timer.delay === 8000) {timers.delete(id);timer.fn();} };
+  return {ctx, element, requests, alerts, respond, data, loadImages, advance, expireRequests};
 }
 
 (async () => {
@@ -103,5 +112,46 @@ function browser() {
   assert.equal(missing.element('setup_model_input').parentElement.hidden, true);
   assert.equal(missing.element('setup_model_input').src, undefined, 'a full photograph must never substitute for a missing crop');
   assert.match(missing.element('capture_stat').innerText, /model input preview unavailable/i);
-  console.log('AP crop-only preview checks passed: stale poll, in-flight POST, old revision, double click, fresh crop/score pairing, out-of-order poll, failure, retry and missing-crop handling.');
+
+  const brokenSensor = browser();
+  await brokenSensor.respond(brokenSensor.requests[0], {...brokenSensor.data(2), temp_c: null, mq7_ppm: null});
+  assert.equal(brokenSensor.element('v_temp').innerText, '--');
+  assert.match(brokenSensor.element('capture_stat').innerText, /Capture #2/);
+
+  const stalled = browser();
+  await stalled.respond(stalled.requests[0], stalled.data(0, 'idle'));
+  stalled.ctx.captureImage(stalled.element('capture_button'));
+  stalled.expireRequests(); await settle();
+  assert.equal(stalled.element('capture_button').disabled, false, 'a hung POST must release the button');
+  assert.match(stalled.element('capture_stat').innerText, /retry/i);
+
+  const waiting = browser();
+  await waiting.respond(waiting.requests[0], waiting.data(0, 'idle'));
+  waiting.ctx.captureImage(waiting.element('capture_button'));
+  await waiting.respond(waiting.requests.at(-1), {status:'ok',previous_photo_revision:0});
+  await waiting.respond(waiting.requests.at(-1), waiting.data(0,'pending'));
+  waiting.advance(51000); waiting.ctx.updateTelemetry();
+  await waiting.respond(waiting.requests.at(-1), waiting.data(0,'pending'));
+  assert.equal(waiting.element('capture_button').disabled, false);
+  assert.match(waiting.element('capture_stat').innerText, /timed out/i);
+
+  const reset = browser();
+  await reset.respond(reset.requests[0], reset.data(4));
+  reset.ctx.captureImage(reset.element('capture_button')); const canceledPost = reset.requests.at(-1);
+  reset.ctx.recalibrateCamera(reset.element('camera_calibrate_button'));
+  const resetPost = reset.requests.at(-1);
+  assert.equal(resetPost.url, '/api/camera/recalibrate');
+  assert.equal(resetPost.options.headers['X-Preventa-Setup'], '1');
+  await reset.respond(canceledPost, {status:'ok',previous_photo_revision:4});
+  assert.equal(reset.requests.at(-1),resetPost,'canceled capture response must not interfere with reset');
+  await reset.respond(resetPost, {status:'ok'});
+  await reset.respond(reset.requests.at(-1), {...reset.data(4,'idle'),camera_calibration_result:'pending',camera_calibration_message:'Restarting sensor'});
+  assert.equal(reset.element('capture_button').disabled,true);
+  assert.equal(reset.element('camera_calibrate_button').disabled,true);
+  reset.ctx.updateTelemetry();
+  await reset.respond(reset.requests.at(-1), {...reset.data(4,'idle'),camera_calibration_result:'accepted',camera_calibration_message:'Camera recalibrated'});
+  assert.equal(reset.element('capture_button').disabled,false);
+  assert.equal(reset.element('camera_calibrate_button').disabled,false);
+  assert.match(reset.element('camera_calibrate_stat').innerText,/recalibrated/);
+  console.log('AP preview checks passed: fresh crop/score pairing, stale responses, null telemetry, request timeouts, retry, and camera recalibration.');
 })().catch(error => { console.error(error); process.exitCode = 1; });

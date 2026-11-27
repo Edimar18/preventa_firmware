@@ -37,6 +37,7 @@
 #include <atomic>
 #include "alarm_hush.h"
 #include "owner_alerts.h"
+#include "camera_transport.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -147,6 +148,13 @@ std::atomic<bool> g_setup_alert_running{false};
 
 bool g_setup_capture_pending = false;
 SetupResult g_setup_capture_result = SetupResult::Idle;
+char g_setup_capture_message[144] = {};
+SetupResult g_setup_cam_calibration_result = SetupResult::Idle;
+char g_setup_cam_calibration_message[144] = {};
+bool g_cam_calibration_pending = false;
+bool g_cam_reset_receiver = false;
+uint32_t g_cam_request_id = 0;
+uint32_t g_cam_active_preview_id = 0;
 uint8_t* g_setup_photo = nullptr;
 size_t g_setup_photo_size = 0;
 constexpr int kModelInputSize = 96;
@@ -179,14 +187,21 @@ HardwareSerial camSerial(1);
 bool          g_cam_query_pending    = false;
 unsigned long g_cam_query_sent_ms    = 0;
 unsigned long g_last_cam_query_ms    = 0;
+uint32_t      g_cam_reply_revision   = 0;
+uint32_t      g_cam_rx_bytes         = 0;
+bool          g_cam_ping_pending     = false;
+bool          g_cam_sensor_fault     = false;
+unsigned long g_cam_ping_started_ms  = 0;
+unsigned long g_cam_last_ping_ms     = 0;
+uint32_t      g_cam_ping_revision    = 0;
 int           g_cam_latest_fire_pct  = 0;
 int           g_cam_latest_state     = 0;
 bool          g_cam_image_streaming  = false;
 String        g_deferred_reading_payload;
 int           g_deferred_reading_tier = -1;
 
-const unsigned long CAM_RESPONSE_TIMEOUT_MS = 90000UL;
-const unsigned long CAM_IMAGE_STALL_TIMEOUT_MS = 10000UL;
+const unsigned long CAM_RESPONSE_TIMEOUT_MS = preventa::cameraRequestTimeoutMs;
+const unsigned long CAM_IMAGE_STALL_TIMEOUT_MS = preventa::cameraStreamStallMs;
 
 // ============================================================================
 // ── SIMCom A7670C CELLULAR MODULE CONFIGURATION (UART2) ─────────────────────
@@ -418,6 +433,8 @@ void           toggleStandbyMode();
 void           handleCaptivePortal();
 void           setupWebServer();
 bool           requestCameraCapture(bool setupPreview);
+bool           requestCameraRecalibration();
+void           failCameraRequest(const char* reason);
 void           finishCameraRequest();
 void           clearTierTest();
 const char*    setupResultName(SetupResult result);
@@ -439,6 +456,7 @@ bool           selfDiagnose();
 bool           checkCameraLink();
 void           updateStatusLEDs();
 void           processCamSerial();
+void           pollCameraLink();
 
 SmoothedData   stepSmoothing(float raw_mq7_v, float raw_acs_v, float temp, float hum);
 void           stepBaselineNormalization(SmoothedData& s);
@@ -569,8 +587,10 @@ void setup() {
         }
     }
     if (!g_sms_alerts) Serial.println("[MODEM] Automatic SMS worker could not start.");
-    camSerial.setRxBufferSize(4096);
+    // Hold an entire 96x96 BMP while the AP services an HTTP request.
+    const size_t cameraRxBytes = camSerial.setRxBufferSize(32 * 1024);
     camSerial.begin(115200, SERIAL_8N1, CAM_SERIAL_RX_PIN, CAM_SERIAL_TX_PIN);
+    Serial.printf("[CAM] UART receive buffer: %u bytes\n", static_cast<unsigned>(cameraRxBytes));
 
     // Load persisted preferences (NVS)
     loadPreferences();
@@ -639,6 +659,7 @@ void loop() {
 
     // 4. Continuously parse incoming prediction & image stream from ESP32-CAM
     processCamSerial();
+    pollCameraLink();
     pollRemoteSettings();
 
     // 5. Update status LEDs according to current operating state
@@ -721,15 +742,21 @@ void clearSetupPreview() {
 }
 
 bool requestCameraCapture(bool setupPreview) {
-    if (!g_remote_settings.cameraEnabled || g_cam_query_pending || g_cam_image_streaming) return false;
+    if (!g_remote_settings.cameraEnabled || g_cam_query_pending || g_cam_image_streaming || g_cam_calibration_pending) return false;
+    g_cam_reset_receiver = true;
+    g_cam_active_preview_id = 0;
     if (setupPreview) {
         clearSetupPreview();
         g_setup_capture_pending = true;
         g_setup_capture_result = SetupResult::Pending;
-        // Legacy camera builds ignore this request and still respond to PREDICT.
-        camSerial.println("MODEL_INPUT_ONCE");
+        strlcpy(g_setup_capture_message, "Waiting for the camera to start...", sizeof(g_setup_capture_message));
+        g_cam_request_id = esp_random();
+        if (!g_cam_request_id) g_cam_request_id = 1;
+        // One command binds the tensor preview and scores to this exact request.
+        camSerial.printf("PREVIEW:%lu\n", static_cast<unsigned long>(g_cam_request_id));
+    } else {
+        camSerial.println("PREDICT");
     }
-    camSerial.println("PREDICT");
     g_cam_query_pending = true;
     g_cam_query_sent_ms = g_last_cam_query_ms = millis();
     return true;
@@ -737,15 +764,51 @@ bool requestCameraCapture(bool setupPreview) {
 
 void finishCameraRequest() {
     if (g_setup_capture_pending && g_setup_capture_result == SetupResult::Pending) {
-        if (g_setup_photo || g_setup_model_input || g_setup_inference.fire_pct >= 0) {
-            ++g_setup_photo_revision;
-            g_setup_capture_result = SetupResult::Accepted;
-        } else {
-            g_setup_capture_result = SetupResult::Failed;
-        }
+        const bool complete = g_setup_model_input && g_setup_inference.fire_pct >= 0;
+        g_setup_capture_result = complete ? SetupResult::Accepted : SetupResult::Failed;
+        if (complete) ++g_setup_photo_revision;
     }
     g_setup_capture_pending = false;
     g_cam_query_pending = false;
+    g_cam_active_preview_id = 0;
+}
+
+void failCameraRequest(const char* reason) {
+    if (g_setup_capture_pending) {
+        clearSetupPreview();
+        g_setup_capture_result = SetupResult::Failed;
+        strlcpy(g_setup_capture_message, reason, sizeof(g_setup_capture_message));
+    }
+    if (g_cam_calibration_pending) {
+        g_setup_cam_calibration_result = SetupResult::Failed;
+        strlcpy(g_setup_cam_calibration_message, reason, sizeof(g_setup_cam_calibration_message));
+    }
+    g_setup_capture_pending = false;
+    g_cam_calibration_pending = false;
+    g_cam_query_pending = false;
+    g_cam_image_streaming = false;
+    g_cam_active_preview_id = 0;
+    g_cam_reset_receiver = true;
+    Serial.printf("[CAM] %s\n", reason);
+}
+
+bool requestCameraRecalibration() {
+    if (!g_remote_settings.cameraEnabled || g_cam_calibration_pending) return false;
+    if (g_cam_query_pending || g_cam_image_streaming) failCameraRequest("Capture canceled for camera recalibration.");
+    clearSetupPreview();
+    g_setup_capture_result = SetupResult::Idle;
+    g_setup_capture_message[0] = 0;
+    g_cam_request_id = esp_random();
+    if (!g_cam_request_id) g_cam_request_id = 1;
+    g_cam_active_preview_id = 0;
+    g_cam_reset_receiver = true;
+    g_cam_calibration_pending = g_cam_query_pending = true;
+    g_setup_cam_calibration_result = SetupResult::Pending;
+    strlcpy(g_setup_cam_calibration_message, "Waiting for camera reset and auto exposure/white balance...", sizeof(g_setup_cam_calibration_message));
+    g_cam_present = false;
+    g_cam_query_sent_ms = millis();
+    camSerial.printf("CAM_RECALIBRATE:%lu\n", static_cast<unsigned long>(g_cam_request_id));
+    return true;
 }
 
 int cameraStateForScore(int fire) {
@@ -757,6 +820,7 @@ int cameraStateForScore(int fire) {
 
 void processCamSerial() {
     static String line = "";
+    static bool discardLine = false;
     static bool reading_img = false;
     static bool readingModelInput = false;
     static size_t img_len = 0;
@@ -764,176 +828,182 @@ void processCamSerial() {
     static uint8_t* img_buf = nullptr;
     static float img_conf = 0.0f;
     static unsigned long img_last_byte_ms = 0;
-    static bool autonomousFrame = false;
-
+    static bool previewFrame = false;
+    const auto resetReceiver = []() {
+        free(img_buf); img_buf = nullptr;
+        line = ""; discardLine = false;
+        img_len = img_idx = 0;
+        reading_img = readingModelInput = false;
+        previewFrame = false;
+        img_conf = 0;
+        g_cam_image_streaming = false;
+        g_cam_reset_receiver = false;
+    };
+    if (g_cam_reset_receiver) resetReceiver();
+    // Absolute request deadlines apply even if noise/late bytes keep arriving.
+    // Progress never extends this deadline.
+    if (g_cam_query_pending && preventa::cameraDeadlineExpired(millis(), g_cam_query_sent_ms)) {
+        failCameraRequest("Camera timed out after 45s. Recalibrate or check power/UART; flash both updated firmwares.");
+        g_cam_present = false;
+        resetReceiver();
+        flushDeferredReadingToBackend();
+    } else if (reading_img && millis() - img_last_byte_ms >= CAM_IMAGE_STALL_TIMEOUT_MS) {
+        Serial.printf("[CAM] Incomplete frame: %u / %u bytes\n", static_cast<unsigned>(img_idx), static_cast<unsigned>(img_len));
+        failCameraRequest("Image transfer stalled for 10s. Recalibrate the camera and retry.");
+        resetReceiver();
+        flushDeferredReadingToBackend();
+    }
     const auto finishFrame = []() {
-        // The CAM can send an unsolicited FIRE/IMG pair while a preview request is pending.
-        if (!autonomousFrame || !g_setup_capture_pending) finishCameraRequest();
-        autonomousFrame = false;
+        // A tracked preview ends only at its matching CAPTURE_END checksum.
+        if (!g_setup_capture_pending && !g_cam_calibration_pending && !previewFrame) finishCameraRequest();
     };
 
-    if (!camSerial.available()) {
-        // Detect a genuinely stalled payload by time since the last received
-        // byte, not total frame duration.
-        if (reading_img && millis() - img_last_byte_ms > CAM_IMAGE_STALL_TIMEOUT_MS) {
-            if (img_buf) free(img_buf);
-            img_buf = nullptr;
-            img_len = 0;
-            img_idx = 0;
-            reading_img = false;
-            readingModelInput = false;
-            g_cam_image_streaming = false;
-            finishFrame();
-            Serial.println("[CAM] Image stream made no progress for 10s; receiver reset.");
-            flushDeferredReadingToBackend();
-        } else if (g_cam_query_pending && millis() - g_cam_query_sent_ms > CAM_RESPONSE_TIMEOUT_MS) {
-            finishCameraRequest();
-            autonomousFrame = false;
-            g_cam_present = false;
-            Serial.println("[CAM] No complete inference/capture response after 90s; check CAM power, UART wiring, and camera status.");
-            flushDeferredReadingToBackend();
-        }
-        return;
-    }
-
-    while (camSerial.available()) {
-        char c = (char)camSerial.read();
-
+    while (camSerial.available() && !g_cam_reset_receiver) {
+        const char c = static_cast<char>(camSerial.read());
+        ++g_cam_rx_bytes;
         if (reading_img) {
-            // Always consume the advertised payload, even if allocation failed.
-            // Otherwise JPEG bytes would be misread as text protocol lines.
-            if (img_idx < img_len && img_buf != nullptr)
-                img_buf[img_idx] = (uint8_t)c;
+            if (img_idx < img_len && img_buf) img_buf[img_idx] = static_cast<uint8_t>(c);
             ++img_idx;
             img_last_byte_ms = millis();
-
             if (img_idx >= img_len) {
                 g_cam_image_streaming = false;
-                if (img_buf != nullptr) {
+                if (img_buf) {
                     if (readingModelInput) {
-                        const bool isBmp = img_len == kModelInputBmpBytes && img_buf[0] == 'B'
-                            && img_buf[1] == 'M' && img_buf[18] == kModelInputSize && img_buf[22] == kModelInputSize;
-                        if (isBmp && g_setup_capture_pending && g_portal_active && g_setup_inference.fire_pct >= 0) {
+                        const bool isBmp = img_len == kModelInputBmpBytes && img_buf[0] == 'B' && img_buf[1] == 'M'
+                            && img_buf[18] == kModelInputSize && img_buf[22] == kModelInputSize;
+                        if (isBmp && g_setup_capture_pending && g_portal_active && g_cam_active_preview_id == g_cam_request_id
+                                && g_setup_inference.fire_pct >= 0) {
                             free(g_setup_model_input);
-                            g_setup_model_input = img_buf;
-                            img_buf = nullptr;
+                            g_setup_model_input = img_buf; img_buf = nullptr;
                         }
                     } else {
-                        const bool isJpeg = img_len >= 4 && img_buf[0] == 0xFF &&
-                                            img_buf[1] == 0xD8 && img_buf[img_len - 2] == 0xFF &&
-                                            img_buf[img_len - 1] == 0xD9;
-                        if (isJpeg && g_setup_capture_pending && !autonomousFrame) {
-                            if (g_portal_active) {
-                                g_setup_photo = img_buf;
-                                g_setup_photo_size = img_len;
-                                img_buf = nullptr;
-                            }
-                        } else if (isJpeg) {
-                            Serial.printf("[CAM] Valid JPEG received: %u bytes (Conf: %.0f%%). Uploading...\n", (unsigned int)img_len, img_conf);
+                        const bool isJpeg = img_len >= 4 && img_buf[0] == 0xFF && img_buf[1] == 0xD8
+                            && img_buf[img_len - 2] == 0xFF && img_buf[img_len - 1] == 0xD9;
+                        if (isJpeg && !previewFrame && !g_setup_capture_pending && !g_cam_calibration_pending) {
                             uploadCaptureToBackend(img_buf, img_len, img_conf);
-                        } else {
-                            Serial.println("[CAM] Rejected frame: invalid JPEG start/end markers.");
                         }
                     }
                     free(img_buf);
-                } else {
-                    Serial.printf("[CAM] Drained %u-byte frame after buffer allocation failed/size limit.\n", (unsigned int)img_len);
                 }
-                img_buf = nullptr;
-                img_len = 0;
-                img_idx = 0;
-                reading_img = false;
+                img_buf = nullptr; img_len = img_idx = 0; reading_img = false;
                 if (readingModelInput) {
                     readingModelInput = false;
-                    g_cam_query_sent_ms = millis();
                 } else {
-                    img_conf = 0.0f;
+                    img_conf = 0;
                     finishFrame();
                     flushDeferredReadingToBackend();
                 }
             }
             continue;
         }
-
-        if (c == '\n') {
-            line.trim();
-
-            if (line.startsWith("PREDICT:")) {
-                autonomousFrame = false;
-                if (g_setup_capture_pending) g_setup_inference = {};
-                int fire = 0;
-                int noFire = 0;
-                if (g_remote_settings.cameraEnabled && sscanf(line.c_str(), "PREDICT:%d,%d", &fire, &noFire) == 2) {
-                    img_conf = (float)fire; // Stored for the upcoming IMG stream!
-                    if (g_setup_capture_pending) {
-                        if (fire >= 0 && fire <= 100 && noFire >= 0 && noFire <= 100) {
-                            g_setup_inference.fire_pct = fire;
-                            g_setup_inference.no_fire_pct = noFire;
-                            g_setup_inference.response_ms = millis() - g_last_cam_query_ms;
-                        }
-                    } else {
-                        g_cam_latest_fire_pct = fire;
-                        g_cam_latest_state = cameraStateForScore(fire);
-                    }
-                    g_cam_present = true;
-                    // Give inference and the subsequent IMG header a full response window.
-                    g_cam_query_sent_ms = millis();
-                    Serial.printf("[CAM] %s inference: Fire=%d%%, NoFire=%d%%\n",
-                                  g_setup_capture_pending ? "Setup" : "Live", fire, noFire);
-                }
-            } else if (line.startsWith("PREDICT_ERROR:")) {
-                finishCameraRequest();
-                autonomousFrame = false;
-                Serial.println("[CAM] Camera inference returned an error.");
-                flushDeferredReadingToBackend();
-            } else if (line.startsWith("FIRE:")) {
-                autonomousFrame = true;
-                img_conf = atof(line.substring(5).c_str());
-            } else if (line.startsWith("IMG:") || line.startsWith("MODEL_INPUT:")) {
-                const bool modelInput = line.startsWith("MODEL_INPUT:");
-                const String lengthText = line.substring(modelInput ? sizeof("MODEL_INPUT:") - 1 : 4);
-                char* end = nullptr;
-                const unsigned long parsedLength = strtoul(lengthText.c_str(), &end, 10);
-                // The camera firmware caps review JPEGs at 96 KiB. Drain up to
-                // 1 MiB if a corrupt/older sender advertises more, so UART text
-                // framing is recovered without attempting a huge allocation.
-                if (end != lengthText.c_str() && *end == '\0' && parsedLength == 0) {
-                    if (!modelInput) {
-                        finishFrame();
-                        g_cam_image_streaming = false;
-                        Serial.println("[CAM] Camera returned a prediction but could not provide a review JPEG.");
-                        flushDeferredReadingToBackend();
-                    }
-                } else if (end != lengthText.c_str() && *end == '\0' && parsedLength > 0 && parsedLength <= 1024UL * 1024UL) {
-                    img_len = (size_t)parsedLength;
-                    img_buf = nullptr;
-                    readingModelInput = modelInput;
-                    const bool needsBuffer = modelInput
-                        ? g_setup_capture_pending && g_portal_active && !autonomousFrame && img_len == kModelInputBmpBytes
-                        : img_len <= 96 * 1024;
-                    if (g_remote_settings.cameraEnabled && needsBuffer) img_buf = (uint8_t*)malloc(img_len);
-                    img_idx = 0;
-                    img_last_byte_ms = millis();
-                    reading_img = true;
-                    g_cam_image_streaming = true;
-                } else {
-                    img_len = 0;
-                    finishFrame();
-                    g_cam_image_streaming = false;
-                    Serial.println("[CAM] Rejected invalid camera image length.");
-                    flushDeferredReadingToBackend();
-                }
-            } else if (line == "PONG" || line.startsWith("CAM_READY:1") || line.startsWith("TEST_CAPTURE") || line.startsWith("STANDBY_OK")) {
-                g_cam_present = true;
-                if (!g_setup_capture_pending || line.startsWith("CAM_READY:1")) finishCameraRequest();
-                if (line.startsWith("CAM_READY:1") && !g_remote_settings.cameraEnabled) applyCameraSetting();
-                flushDeferredReadingToBackend();
-            }
-
-            line = "";
-        } else {
-            line += c;
+        if (c != '\n') {
+            if (!discardLine && line.length() < preventa::cameraMaxLineBytes) line += c;
+            else { line = ""; discardLine = true; }
+            continue;
         }
+        if (discardLine) { discardLine = false; line = ""; continue; }
+        line.trim();
+        unsigned long token = 0, checksum = 0;
+        char extra = 0;
+        if (sscanf(line.c_str(), "CAPTURE_BEGIN:%lu%c", &token, &extra) == 1) {
+            previewFrame = true;
+            g_cam_active_preview_id = g_setup_capture_pending && token == g_cam_request_id ? token : 0;
+            if (g_cam_active_preview_id) {
+                g_cam_present = true;
+                ++g_cam_reply_revision;
+                strlcpy(g_setup_capture_message, "Camera is capturing and running inference...", sizeof(g_setup_capture_message));
+            }
+        } else if (sscanf(line.c_str(), "CAPTURE_END:%lu,%lu%c", &token, &checksum, &extra) == 2) {
+            if (g_setup_capture_pending && token == g_cam_request_id && g_cam_active_preview_id == g_cam_request_id) {
+                if (g_setup_model_input && g_setup_inference.fire_pct >= 0
+                        && checksum == preventa::cameraPreviewChecksum(g_setup_model_input, kModelInputBmpBytes)) {
+                    strlcpy(g_setup_capture_message, "Fresh 96 x 96 model input received and verified.", sizeof(g_setup_capture_message));
+                    finishCameraRequest();
+                } else failCameraRequest("Preview was incomplete or corrupted. Recalibrate the camera and retry.");
+            }
+            previewFrame = false;
+        } else if (line.startsWith("CAPTURE_ERROR:")) {
+            ++g_cam_reply_revision;
+            if (sscanf(line.c_str(), "CAPTURE_ERROR:%lu,", &token) == 1 && g_setup_capture_pending && token == g_cam_request_id) {
+                String reason = "Camera capture failed: " + line.substring(line.indexOf(',') + 1);
+                failCameraRequest(reason.c_str());
+            }
+            previewFrame = false;
+        } else if (line.startsWith("CAM_RECALIBRATE_BEGIN:")) {
+            if (sscanf(line.c_str(), "CAM_RECALIBRATE_BEGIN:%lu", &token) == 1 && g_cam_calibration_pending && token == g_cam_request_id)
+                strlcpy(g_setup_cam_calibration_message, "Restarting sensor and settling auto exposure/white balance...", sizeof(g_setup_cam_calibration_message));
+        } else if (line.startsWith("CAM_RECALIBRATED:")) {
+            if (sscanf(line.c_str(), "CAM_RECALIBRATED:%lu,", &token) == 1 && g_cam_calibration_pending && token == g_cam_request_id) {
+                if (line.endsWith(",OK")) {
+                    g_cam_calibration_pending = false;
+                    g_setup_cam_calibration_result = SetupResult::Accepted;
+                    strlcpy(g_setup_cam_calibration_message, "Camera recalibrated. Capture a new image to check it.", sizeof(g_setup_cam_calibration_message));
+                    g_cam_present = true;
+                    g_cam_sensor_fault = false;
+                    ++g_cam_reply_revision;
+                    finishCameraRequest();
+                    applyCameraSetting();
+                } else {
+                    String reason = "Camera recalibration failed: " + line.substring(line.indexOf(',') + 1);
+                    failCameraRequest(reason.c_str());
+                }
+            }
+        } else if (line.startsWith("PREDICT:")) {
+            int fire = -1, noFire = -1;
+            if (sscanf(line.c_str(), "PREDICT:%d,%d%c", &fire, &noFire, &extra) == 2
+                    && fire >= 0 && fire <= 100 && noFire >= 0 && noFire <= 100 && g_remote_settings.cameraEnabled) {
+                img_conf = fire;
+                if (g_setup_capture_pending && g_cam_active_preview_id == g_cam_request_id) {
+                    g_setup_inference.fire_pct = fire;
+                    g_setup_inference.no_fire_pct = noFire;
+                    g_setup_inference.response_ms = millis() - g_last_cam_query_ms;
+                    strlcpy(g_setup_capture_message, "Inference received; transferring the 96 x 96 model input...", sizeof(g_setup_capture_message));
+                } else if (!previewFrame && g_cam_query_pending && !g_cam_calibration_pending && !g_setup_capture_pending) {
+                    g_cam_latest_fire_pct = fire;
+                    g_cam_latest_state = cameraStateForScore(fire);
+                }
+                g_cam_present = true;
+                Serial.printf("[CAM] Inference: Fire=%d%%, NoFire=%d%%\n", fire, noFire);
+            }
+        } else if (line.startsWith("PREDICT_ERROR:")) {
+            if (!g_setup_capture_pending && !g_cam_calibration_pending) failCameraRequest("Live camera inference failed.");
+        } else if (line.startsWith("FIRE:")) {
+            previewFrame = false;
+            img_conf = atof(line.substring(5).c_str());
+        } else if (line.startsWith("IMG:") || line.startsWith("MODEL_INPUT:")) {
+            const bool modelInput = line.startsWith("MODEL_INPUT:");
+            const String text = line.substring(modelInput ? sizeof("MODEL_INPUT:") - 1 : 4);
+            char* end = nullptr;
+            const unsigned long length = strtoul(text.c_str(), &end, 10);
+            if (end != text.c_str() && *end == '\0' && length == 0) {
+                if (!modelInput) { finishFrame(); flushDeferredReadingToBackend(); }
+            } else if (end != text.c_str() && *end == '\0' && length > 0 && length <= 1024UL * 1024UL) {
+                img_len = length; img_idx = 0; img_buf = nullptr;
+                readingModelInput = modelInput;
+                const bool needsBuffer = modelInput
+                    ? g_setup_capture_pending && g_portal_active && g_cam_active_preview_id == g_cam_request_id && img_len == kModelInputBmpBytes
+                    : !previewFrame && !g_setup_capture_pending && !g_cam_calibration_pending && img_len <= 96 * 1024;
+                if (g_remote_settings.cameraEnabled && needsBuffer) img_buf = static_cast<uint8_t*>(malloc(img_len));
+                img_last_byte_ms = millis();
+                reading_img = g_cam_image_streaming = true;
+            } else failCameraRequest("Invalid camera frame length. Recalibrate the camera and retry.");
+        } else if (line == "PONG" || line == "CAM_READY:1" || line.startsWith("TEST_CAPTURE") || line == "STANDBY_OK") {
+            if (line == "CAM_READY:1") g_cam_sensor_fault = false;
+            g_cam_present = !g_cam_sensor_fault;
+            ++g_cam_reply_revision;
+            if (line == "CAM_READY:1" && g_cam_query_pending) failCameraRequest("Camera restarted during the request. Retry capture.");
+            if (line == "CAM_READY:1" && !g_remote_settings.cameraEnabled) applyCameraSetting();
+        } else if (line.startsWith("STATUS:OK,") || line.startsWith("STATUS:ERR,")) {
+            ++g_cam_reply_revision;
+            g_cam_sensor_fault = line.startsWith("STATUS:ERR,");
+            g_cam_present = !g_cam_sensor_fault;
+        } else if (line == "CAM_READY:0") {
+            ++g_cam_reply_revision;
+            g_cam_sensor_fault = true;
+            g_cam_present = false;
+            if (g_cam_query_pending) failCameraRequest("Camera initialization failed. Check camera power and connection.");
+        }
+        line = "";
     }
 }
 
@@ -1172,6 +1242,7 @@ const char* testSmsRecipient() {
 
 void startCaptivePortal() {
     if (g_portal_active) return;
+    g_cam_last_ping_ms = millis() - 10000UL;
     if (!g_owner_active.load()) {
         snprintf(g_pairing_code, sizeof(g_pairing_code), "%06lu", (unsigned long)(esp_random() % 1000000UL));
         g_pairing_started_ms = millis();
@@ -1327,6 +1398,9 @@ void setupWebServer() {
 "<p>For zero calibration, use your normal power source and unplug every load from the monitored outlet. Keep the mains enclosure closed.</p>"
 "<button type='button' class='btn btn-sec' onclick='calibrateCurrent(this)'>Calibrate ACS712 Zero</button>"
 "<div id='acs_stat' class='status-msg' aria-live='polite'></div>"
+"<p>Camera recalibration restarts the sensor and refreshes auto exposure/white balance. It does not retrain the model.</p>"
+"<button type='button' id='camera_calibrate_button' class='btn btn-sec' onclick='recalibrateCamera(this)'>Recalibrate ESP32-CAM</button>"
+"<div id='camera_calibrate_stat' style='font-size:12px;margin-top:6px' aria-live='polite'></div>"
 "<button type='button' id='capture_button' class='btn btn-sec' onclick='captureImage(this)'>Capture Image</button>"
 "<div id='capture_stat' style='font-size:12px;margin-top:6px' aria-live='polite'></div>"
 "<p>Model input: the central 96 × 96 pixels used for this prediction, enlarged for inspection.</p>"
@@ -1384,7 +1458,13 @@ void setupWebServer() {
 "function togglePwd(){var x=document.getElementById('pwd');x.type=(x.type==='password')?'text':'password';}"
 "function showMsg(id,txt,col){var e=document.getElementById(id);if(!e)return;e.style.display='block';e.style.background=col;e.innerText=txt;setTimeout(function(){e.style.display='none';},4000);}"
 "const setupResult={idle:'Ready',pending:'Working...',accepted:'Accepted by provider',failed:'Failed',offline:'Needs ESP32 internet access',no_browser:'No registered browser',rate_limited:'Try again in a minute'};"
-"let captureRequesting=false,captureEpoch=0,captureRevisionFloor=null,lastPhotoRevision=null,statusRequest=0,statusApplied=0;"
+"let captureRequesting=false,cameraCalibrating=false,cameraUiError='',captureStartedAt=0,captureEpoch=0,captureRevisionFloor=null,lastPhotoRevision=null,statusRequest=0,statusApplied=0;"
+"async function setupJson(url,options={}){"
+"const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),8000);"
+"try{const response=await fetch(url,{...options,signal:controller.signal});return await response.json();}finally{clearTimeout(timer);}"
+"}"
+"function sensorNumber(value,digits){return Number.isFinite(value)?value.toFixed(digits):'--';}"
+
 "function showCapturePreview(id,visible,path,revision){"
 "const image=document.getElementById(id),figure=image.parentElement;"
 "image.dataset.visible=visible?'1':'0';"
@@ -1397,12 +1477,12 @@ void setupWebServer() {
 "}"
 "function updateTelemetry(){"
 "const epoch=captureEpoch,request=++statusRequest;"
-"fetch('/api/status',{cache:'no-store'}).then(r=>r.json()).then(d=>{"
+"setupJson('/api/status',{cache:'no-store'}).then(d=>{"
 "if(epoch!==captureEpoch||request<statusApplied)return;statusApplied=request;lastPhotoRevision=d.photo_revision;"
-"document.getElementById('v_ppm').innerText=d.mq7_ppm.toFixed(0);"
-"document.getElementById('v_curr').innerText=d.current_a.toFixed(2);"
-"document.getElementById('v_temp').innerText=d.temp_c.toFixed(1);"
-"document.getElementById('v_hum').innerText=d.humidity.toFixed(0);"
+"document.getElementById('v_ppm').innerText=sensorNumber(d.mq7_ppm,0);"
+"document.getElementById('v_curr').innerText=sensorNumber(d.current_a,2);"
+"document.getElementById('v_temp').innerText=sensorNumber(d.temp_c,1);"
+"document.getElementById('v_hum').innerText=sensorNumber(d.humidity,0);"
 "document.getElementById('v_tier').innerText='T' + d.tier;"
 "document.getElementById('owner_state').textContent=d.activation_state==='active'?'Activated. Local and remote features enabled.':d.activation_state==='pending'?'Linked to an owner. Waiting for synchronization.':'Local monitoring active. Owner setup incomplete.';"
 "document.getElementById('owner_device').textContent=d.device_id||'';"
@@ -1410,11 +1490,16 @@ void setupWebServer() {
 "document.getElementById('owner_pin').textContent=d.pairing_code||'Not available';"
 "document.getElementById('owner_pin_time').textContent=d.pairing_remaining_sec?'('+d.pairing_remaining_sec+'s remaining)':'';"
 "document.getElementById('v_hush').innerText=d.buzzer_hushed?'Buzzer hushed: '+d.hush_remaining_sec+'s remaining. Monitoring and protection active.':(d.buzzer_active?'Buzzer sounding.':'Buzzer idle.');"
-"document.getElementById('v_cam').innerText='Camera Link: ' + (d.cam_link?'ONLINE':'DISCONNECTED');"
+"const cameraStates={ready:'Reply received',no_reply:'No valid reply - check CAM TX to main GPIO21',checking:'Checking return link...',capturing:'Capture requested; awaiting completion',recalibrating:'Camera recalibrating...',sensor_error:'Camera replies, but sensor/model is not ready',disabled:'Disabled in settings'};"
+"document.getElementById('v_cam').innerText='Camera link: '+(cameraStates[d.cam_link_status]||(d.cam_link?'Reply received':'No valid reply'))+' | UART bytes received: '+(d.cam_rx_bytes||0);"
 "document.getElementById('baseline_stat').innerText=d.baseline_samples < d.baseline_target?'Collecting baseline: '+d.baseline_samples+' / '+d.baseline_target:'Sensor baselines ready.';"
-"const pending=captureRequesting||d.capture_result==='pending';"
-"const complete=!pending&&d.capture_result==='accepted'&&(captureRevisionFloor===null||d.photo_revision!==captureRevisionFloor);"
-"document.getElementById('capture_button').disabled=pending;"
+"const browserExpired=captureStartedAt>0&&Date.now()-captureStartedAt>50000;"
+"const pending=!browserExpired&&(captureRequesting||d.capture_result==='pending');"
+"const calibrating=cameraCalibrating||d.camera_calibration_result==='pending';"
+"document.getElementById('camera_calibrate_button').disabled=calibrating;"
+"document.getElementById('camera_calibrate_stat').innerText=cameraUiError||d.camera_calibration_message||'';"
+"const complete=!pending&&!calibrating&&d.capture_result==='accepted'&&(captureRevisionFloor===null||d.photo_revision!==captureRevisionFloor);"
+"document.getElementById('capture_button').disabled=pending||calibrating;"
 "showCapturePreview('setup_model_input',complete&&d.model_input_ready,'/api/model-input.bmp',d.photo_revision);"
 "var details=document.getElementById('capture_inference');details.hidden=!complete;"
 "if(!details.hidden){"
@@ -1425,9 +1510,10 @@ void setupWebServer() {
 "}else details.innerText='The camera returned no valid prediction scores for this capture.';"
 "}"
 "const captureStatus='Capture #'+d.photo_revision+': '+(d.model_input_ready?'96 x 96 model input ready.':'model input preview unavailable. Update the ESP32-CAM firmware or retry.');"
-"document.getElementById('capture_stat').innerText=pending?'Capturing a new image...':complete?captureStatus:d.capture_result==='failed'?'Camera capture failed. Check the camera link and retry.':'';"
+"document.getElementById('capture_stat').innerText=browserExpired?'Camera response timed out. Recalibrate the camera and retry.':pending?(d.capture_message||'Capturing a new image...')+' ('+(d.capture_elapsed_sec||0)+'s / 45s)':complete?captureStatus:d.capture_result==='failed'?(d.capture_message||'Camera capture failed. Check the camera link and retry.') :'';"
+"if(complete||d.capture_result==='failed')captureStartedAt=0;"
 "document.getElementById('tier_delivery').innerText=d.test_sms==='idle'&&d.test_push==='idle'?'':'Test SMS: '+setupResult[d.test_sms]+' | Test push: '+setupResult[d.test_push];"
-"}).catch(e=>{});}"
+"}).catch(()=>{if(captureStartedAt&&Date.now()-captureStartedAt>50000){captureRequesting=false;document.getElementById('capture_button').disabled=false;document.getElementById('capture_stat').innerText='Camera status unavailable. Reconnect to device Wi-Fi, then recalibrate and retry.';}});}"
 "setInterval(updateTelemetry,2000);updateTelemetry();"
 "function renewPairing(button){button.disabled=true;fetch('/api/pairing',{method:'POST',headers:{'X-Preventa-Setup':'1'}}).then(r=>r.json()).then(d=>{showMsg('tier_msg',d.message,d.status==='ok'?'#37474f':'#d32f2f');updateTelemetry();}).catch(()=>{}).finally(()=>{button.disabled=false;});}"
 "function calibrateBaseline(button){"
@@ -1436,13 +1522,22 @@ void setupWebServer() {
 "showMsg('acs_stat',d.message,d.status==='ok'?'#2e7d32':'#d32f2f');updateTelemetry();"
 "}).catch(()=>showMsg('acs_stat','Could not start baseline calibration.','#d32f2f')).finally(()=>{button.disabled=false;});}"
 "function captureImage(button){"
-"if(button.disabled||captureRequesting)return;captureRequesting=true;button.disabled=true;++captureEpoch;captureRevisionFloor=lastPhotoRevision;"
+"if(button.disabled||captureRequesting||cameraCalibrating)return;"
+"captureRequesting=true;button.disabled=true;const epoch=++captureEpoch;captureStartedAt=Date.now();captureRevisionFloor=lastPhotoRevision;"
 "showCapturePreview('setup_model_input',false,'/api/model-input.bmp',0);"
 "document.getElementById('capture_inference').hidden=true;document.getElementById('capture_stat').innerText='Capturing a new image...';"
-"fetch('/api/capture',{method:'POST',cache:'no-store'}).then(r=>r.json()).then(d=>{"
-"captureRequesting=false;++captureEpoch;"
-"if(d.status==='ok'){if(Number.isInteger(d.previous_photo_revision))captureRevisionFloor=d.previous_photo_revision;}else{button.disabled=false;alert(d.message);}updateTelemetry();"
-"}).catch(()=>{captureRequesting=false;++captureEpoch;button.disabled=false;document.getElementById('capture_stat').innerText='Could not request a capture. Please retry.';});}"
+"setupJson('/api/capture',{method:'POST',cache:'no-store'}).then(d=>{"
+"if(epoch!==captureEpoch)return;captureRequesting=false;++captureEpoch;"
+"if(d.status==='ok'){if(Number.isInteger(d.previous_photo_revision))captureRevisionFloor=d.previous_photo_revision;}else{captureStartedAt=0;button.disabled=false;alert(d.message);}updateTelemetry();"
+"}).catch(()=>{if(epoch!==captureEpoch)return;captureStartedAt=0;captureRequesting=false;++captureEpoch;button.disabled=false;document.getElementById('capture_stat').innerText='Could not request a capture. Reconnect to device Wi-Fi and retry.';});}"
+"function recalibrateCamera(button){"
+"if(button.disabled||cameraCalibrating||!confirm('Restart the camera sensor and refresh auto exposure/white balance? Any unfinished capture will be canceled.'))return;"
+"cameraCalibrating=true;cameraUiError='';captureRequesting=false;captureStartedAt=0;++captureEpoch;button.disabled=true;"
+"showCapturePreview('setup_model_input',false,'/api/model-input.bmp',0);document.getElementById('capture_inference').hidden=true;"
+"document.getElementById('camera_calibrate_stat').innerText='Requesting camera recalibration...';"
+"setupJson('/api/camera/recalibrate',{method:'POST',headers:{'X-Preventa-Setup':'1'},cache:'no-store'}).then(d=>{"
+"cameraCalibrating=false;if(d.status!=='ok'){cameraUiError=d.message;button.disabled=false;document.getElementById('camera_calibrate_stat').innerText=cameraUiError;}updateTelemetry();"
+"}).catch(()=>{cameraCalibrating=false;button.disabled=false;cameraUiError='Could not request camera recalibration. Check the AP connection and retry.';document.getElementById('camera_calibrate_stat').innerText=cameraUiError;});}"
 "function calibrateCurrent(button){"
 "if(!confirm('Are all appliances unplugged from the monitored outlet?'))return;"
 "button.disabled=true;"
@@ -1510,6 +1605,7 @@ void setupWebServer() {
 
     webServer.on("/api/status", HTTP_GET, []() {
         auto quote = [](const char* value) { JsonDocument quoted; quoted.set(value); String result; serializeJson(quoted, result); return result; };
+        auto number = [](float value, int digits) { return isfinite(value) ? String(value, digits) : String("null"); };
         String json = "{";
         json += "\"device_id\":" + quote(g_device_id) + ",";
         json += "\"activation_state\":" + quote(g_remote_settings.activationState) + ",";
@@ -1518,16 +1614,25 @@ void setupWebServer() {
             && preventa::pairingWindowOpen(millis(), g_pairing_started_ms);
         json += "\"pairing_code\":" + quote(pairing_open ? g_pairing_code : "") + ",";
         json += "\"pairing_remaining_sec\":" + String(pairing_open ? (preventa::pairingDurationMs - (millis() - g_pairing_started_ms)) / 1000UL : 0) + ",";
-        json += "\"mq7_ppm\":" + String(g_ui_mq7_ppm, 1) + ",";
-        json += "\"temp_c\":" + String(g_ui_temp, 1) + ",";
-        json += "\"humidity\":" + String(g_ui_hum, 1) + ",";
-        json += "\"current_a\":" + String(g_ui_current, 3) + ",";
+        json += "\"mq7_ppm\":" + number(g_ui_mq7_ppm, 1) + ",";
+        json += "\"temp_c\":" + number(g_ui_temp, 1) + ",";
+        json += "\"humidity\":" + number(g_ui_hum, 1) + ",";
+        json += "\"current_a\":" + number(g_ui_current, 3) + ",";
         json += "\"cam_link\":" + String(g_cam_present ? "true" : "false") + ",";
+        const char* cameraLinkState = !g_remote_settings.cameraEnabled ? "disabled" : g_cam_calibration_pending ? "recalibrating"
+            : g_cam_query_pending ? "capturing" : g_cam_sensor_fault ? "sensor_error" : g_cam_ping_pending ? "checking"
+            : g_cam_present ? "ready" : "no_reply";
+        json += "\"cam_link_status\":" + quote(cameraLinkState) + ",";
+        json += "\"cam_rx_bytes\":" + String(g_cam_rx_bytes) + ",";
         json += "\"cam_fire_pct\":" + String(g_cam_latest_fire_pct) + ",";
         json += "\"baseline_samples\":" + String(min(g_baseline_sample_count, BASELINE_SAMPLES)) + ",";
         json += "\"baseline_target\":" + String(BASELINE_SAMPLES) + ",";
         json += "\"photo_revision\":" + String(g_setup_photo_revision) + ",";
         json += "\"capture_result\":\"" + String(setupResultName(g_setup_capture_result)) + "\",";
+        json += "\"capture_message\":" + quote(g_setup_capture_message) + ",";
+        json += "\"capture_elapsed_sec\":" + String(g_setup_capture_pending ? (millis() - g_cam_query_sent_ms) / 1000UL : 0) + ",";
+        json += "\"camera_calibration_result\":\"" + String(setupResultName(g_setup_cam_calibration_result)) + "\",";
+        json += "\"camera_calibration_message\":" + quote(g_setup_cam_calibration_message) + ",";
         json += "\"photo_ready\":" + String(g_setup_photo ? "true" : "false") + ",";
         json += "\"model_input_ready\":" + String(g_setup_model_input ? "true" : "false") + ",";
         json += "\"preview_inference\":";
@@ -1594,6 +1699,23 @@ void setupWebServer() {
         String message = "Simulating Tier " + String(tier) + " for 30 seconds.";
         if (tier >= 3 && !capture) message += " Camera is disabled or busy.";
         webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"" + message + "\"}");
+    });
+
+    webServer.on("/api/camera/recalibrate", HTTP_POST, []() {
+        if (webServer.header("X-Preventa-Setup") != "1") {
+            webServer.send(403, "application/json", "{\"status\":\"error\",\"message\":\"Open the device setup page to recalibrate.\"}");
+            return;
+        }
+        if (g_ui_tier >= 3 || g_tier_test_override >= 3) {
+            webServer.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Resolve the active warning or clear the tier test before camera recalibration.\"}");
+            return;
+        }
+        if (!requestCameraRecalibration()) {
+            webServer.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Camera is disabled or already recalibrating.\"}");
+            return;
+        }
+        webServer.sendHeader("Cache-Control", "no-store");
+        webServer.send(202, "application/json", "{\"status\":\"ok\",\"message\":\"Camera recalibration started.\"}");
     });
 
     webServer.on("/api/capture", HTTP_POST, []() {
@@ -1782,28 +1904,36 @@ String getTimestampString() {
 // ============================================================================
 // ── SELF-DIAGNOSTIC & STATUS INDICATORS ─────────────────────────────────────
 // ============================================================================
-bool checkCameraLink() {
-    // A diagnostic ping must not flush the binary image currently being sent.
-    if (g_cam_query_pending) return g_cam_present;
-
-    while (camSerial.available()) camSerial.read();
-
+void pollCameraLink() {
+    if (!g_remote_settings.cameraEnabled || g_cam_query_pending || g_cam_image_streaming || g_cam_calibration_pending) {
+        g_cam_ping_pending = false;
+        return;
+    }
+    const unsigned long now = millis();
+    if (g_cam_ping_pending) {
+        if (g_cam_reply_revision != g_cam_ping_revision) g_cam_ping_pending = false;
+        else if (now - g_cam_ping_started_ms >= 1500UL) {
+            g_cam_present = false;
+            g_cam_ping_pending = false;
+        } else return;
+    }
+    if (now - g_cam_last_ping_ms < 10000UL) return;
+    g_cam_ping_revision = g_cam_reply_revision;
+    g_cam_ping_started_ms = g_cam_last_ping_ms = now;
+    g_cam_ping_pending = true;
     camSerial.println("PING");
-    unsigned long start = millis();
-    String resp = "";
-    while (millis() - start < 400) {
-        while (camSerial.available()) {
-            char c = (char)camSerial.read();
-            if (c == '\n') {
-                resp.trim();
-                if (resp == "PONG" || resp.startsWith("CAM_READY:1")) {
-                    return true;
-                }
-                resp = "";
-            } else {
-                resp += c;
-            }
-        }
+}
+
+bool checkCameraLink() {
+    processCamSerial();
+    if (g_cam_query_pending || g_cam_image_streaming || g_cam_calibration_pending) return g_cam_present;
+    const uint32_t revision = g_cam_reply_revision;
+    camSerial.println("PING");
+    const unsigned long started = millis();
+    while (millis() - started < 400) {
+        processCamSerial();
+        if (g_cam_reply_revision != revision) return g_cam_present;
+        delay(1);
     }
     return false;
 }
