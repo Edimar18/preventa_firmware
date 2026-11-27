@@ -36,6 +36,7 @@
 #include <math.h>
 #include <atomic>
 #include "alarm_hush.h"
+#include "owner_alerts.h"
 #if __has_include("secrets.h")
 #include "secrets.h"
 #else
@@ -73,10 +74,31 @@ String g_backend_readings_url;
 String g_backend_captures_url;
 String g_backend_config_url;
 String g_backend_setup_push_url;
+String g_backend_provisioning_url;
+String g_backend_activation_url;
+std::atomic<bool> g_owner_active{false};
+bool g_activation_ack_requested = false;
+bool g_pairing_publish_pending = false;
+char g_pairing_code[7] = {};
+unsigned long g_pairing_started_ms = 0;
+
+struct ConfigFetchRequest {
+    bool publishPairing = false;
+    bool acknowledge = false;
+    char pairingCode[7] = {};
+    char version[65] = {};
+    char generation[37] = {};
+};
 RemoteSettings g_remote_settings;
+portMUX_TYPE g_owner_settings_lock = portMUX_INITIALIZER_UNLOCKED;
+
+
 
 struct ConfigDownload {
-    char body[1025];
+    char body[2049];
+    int statusCode = 0;
+    bool pairingPublished = false;
+    char pairingCode[7] = {};
 };
 QueueHandle_t g_config_downloads = nullptr;
 bool g_config_fetch_running = false;
@@ -92,7 +114,7 @@ int g_backend_consecutive_fails             = 0;
 // ============================================================================
 // ── SOFTAP & CAPTIVE PORTAL ─────────────────────────────────────────────────
 // ============================================================================
-const char* AP_SSID = "PREVENTA-Setup";
+const char* AP_SSID = PREVENTA_SETUP_SSID;
 const byte  DNS_PORT = 53;
 IPAddress   apIP(192, 168, 4, 1);
 IPAddress   netMsk(255, 255, 255, 0);
@@ -118,7 +140,7 @@ int g_tier_test_override = -1;
 bool g_tier_test_relay_cut = false;
 unsigned long g_tier_test_start_ms = 0;
 
-enum class SetupResult { Idle, Pending, Accepted, Failed, Offline, NoBrowser, RateLimited };
+enum class SetupResult { Idle, Pending, Accepted, Failed, Offline, NoBrowser, RateLimited, NotActivated };
 std::atomic<SetupResult> g_setup_sms_result{SetupResult::Idle};
 std::atomic<SetupResult> g_setup_push_result{SetupResult::Idle};
 std::atomic<bool> g_setup_alert_running{false};
@@ -244,16 +266,13 @@ const int POST_ALARM_COOLDOWN = 150;
 const char* TIER_NAMES[]   = { "Normal", "Advisory", "Caution", "Warning", "Danger", "Emergency" };
 const char* STATE_LABELS[] = { "Normal", "Mild", "Moderate", "Severe" };
 const char* FIRE_TYPES[]   = { "unknown", "electrical", "smoldering", "open_fire" };
-const char* const SMS_ALERT_BODIES[] = {
-    "PREVENTA | Tier 3: Warning. Possible fire risk detected. Check from a safe location. If you see smoke or flames, leave and call emergency services.",
-    "PREVENTA | Tier 4: Danger. High fire risk detected. Move to safety. If you see smoke or flames, evacuate and call emergency services.",
-    "PREVENTA | Tier 5: Emergency. Leave the affected area now. Call emergency services from a safe location. Do not re-enter until cleared."
-};
+
 const char* const SETUP_TEST_SMS = "PREVENTA test message. No emergency action is needed.";
 
 struct SmsAlert {
     char recipient[17];
-    const char* message;
+    char message[161];
+    char generation[37];
 };
 
 // ============================================================================
@@ -473,6 +492,18 @@ void           printDebugSummary(SmoothedData& s, SensorStates& st, FusionData& 
 // ============================================================================
 // ── SETUP ───────────────────────────────────────────────────────────────────
 // ============================================================================
+void copyOwnerSettings(RemoteSettings& output) {
+    portENTER_CRITICAL(&g_owner_settings_lock);
+    output = g_remote_settings;
+    portEXIT_CRITICAL(&g_owner_settings_lock);
+}
+
+void storeOwnerSettings(const RemoteSettings& settings) {
+    portENTER_CRITICAL(&g_owner_settings_lock);
+    g_remote_settings = settings;
+    portEXIT_CRITICAL(&g_owner_settings_lock);
+}
+
 void setup() {
     // Preload the idle level before enabling the GPIO output.
     gpio_set_level(static_cast<gpio_num_t>(RELAY_PIN), relayOutputLevel(false));
@@ -653,9 +684,10 @@ void loop() {
             startCaptivePortal();
         } else if (cmd.equalsIgnoreCase("reset_wifi")) {
             preferences.begin("preventa", false);
-            preferences.clear();
+            preferences.remove("ssid");
+            preferences.remove("pass");
             preferences.end();
-            Serial.println("[CMD] Stored credentials cleared. Rebooting into Portal mode...");
+            Serial.println("[CMD] Stored Wi-Fi cleared. Device identity and owner cache retained.");
             delay(500);
             ESP.restart();
         } else if (cmd.equalsIgnoreCase("test_relay") || cmd.equalsIgnoreCase("relay_test") || cmd.equalsIgnoreCase("test relay")) {
@@ -909,22 +941,26 @@ void processCamSerial() {
 // ── PREFERENCES & CAPTIVE PORTAL PROVISIONING ───────────────────────────────
 // ============================================================================
 void loadPreferences() {
-    preferences.begin("preventa", true);
-    String s_ssid   = preferences.getString("ssid", DEFAULT_WIFI_SSID);
-    String s_pass   = preferences.getString("pass", DEFAULT_WIFI_PASSWORD);
-    String s_host   = preferences.getString("host", DEFAULT_BACKEND_HOST);
-    String s_dev_id = preferences.getString("dev_id", DEFAULT_DEVICE_ID);
-    String s_dev_key= preferences.getString("dev_key", DEFAULT_DEVICE_KEY);
+    preferences.begin("preventa", false);
+    const String provisioned = preferences.getString("provisioned_id", "");
+    if (provisioned != DEFAULT_DEVICE_ID) {
+        preferences.remove("ssid");
+        preferences.remove("pass");
+        preferences.remove("remote_cfg");
+        preferences.remove("dev_id");
+        preferences.remove("dev_key");
+        preferences.putString("provisioned_id", DEFAULT_DEVICE_ID);
+        Serial.println("[Config] New provisioned identity: old Wi-Fi and owner cache cleared.");
+    }
+    String s_ssid = preferences.getString("ssid", DEFAULT_WIFI_SSID);
+    String s_pass = preferences.getString("pass", DEFAULT_WIFI_PASSWORD);
     preferences.end();
-
-    strncpy(g_wifi_ssid, s_ssid.c_str(), sizeof(g_wifi_ssid) - 1);
-    strncpy(g_wifi_pass, s_pass.c_str(), sizeof(g_wifi_pass) - 1);
-    strncpy(g_backend_host, s_host.c_str(), sizeof(g_backend_host) - 1);
-    strncpy(g_device_id, s_dev_id.c_str(), sizeof(g_device_id) - 1);
-    strncpy(g_device_key, s_dev_key.c_str(), sizeof(g_device_key) - 1);
-
-    const char* cloud_target = CLOUD_HTTPS_ORIGIN[0] ? CLOUD_HTTPS_ORIGIN : g_backend_host;
-    Serial.printf("[Config] Loaded Cloud Target: %s | Device ID: %s\n", cloud_target, g_device_id);
+    strlcpy(g_wifi_ssid, s_ssid.c_str(), sizeof(g_wifi_ssid));
+    strlcpy(g_wifi_pass, s_pass.c_str(), sizeof(g_wifi_pass));
+    strlcpy(g_backend_host, DEFAULT_BACKEND_HOST, sizeof(g_backend_host));
+    strlcpy(g_device_id, DEFAULT_DEVICE_ID, sizeof(g_device_id));
+    strlcpy(g_device_key, DEFAULT_DEVICE_KEY, sizeof(g_device_key));
+    Serial.printf("[Config] Provisioned device: %s\n", g_device_id);
 }
 
 void savePreferences(const char* ssid, const char* pass, const char* host, const char* dev_id, const char* dev_key) {
@@ -932,15 +968,13 @@ void savePreferences(const char* ssid, const char* pass, const char* host, const
     preferences.putString("ssid", ssid);
     preferences.putString("pass", pass);
     preferences.putString("host", host);
-    preferences.putString("dev_id", dev_id);
-    preferences.putString("dev_key", dev_key);
+
     preferences.end();
 
     strncpy(g_wifi_ssid, ssid, sizeof(g_wifi_ssid) - 1);
     strncpy(g_wifi_pass, pass, sizeof(g_wifi_pass) - 1);
     strncpy(g_backend_host, host, sizeof(g_backend_host) - 1);
-    strncpy(g_device_id, dev_id, sizeof(g_device_id) - 1);
-    strncpy(g_device_key, dev_key, sizeof(g_device_key) - 1);
+
 
     rebuildUrls();
     Serial.println("[Config] Settings saved to non-volatile storage (NVS).");
@@ -965,6 +999,8 @@ void rebuildUrls() {
         g_backend_readings_url = "";
         g_backend_captures_url = "";
         g_backend_config_url = "";
+        g_backend_provisioning_url = "";
+        g_backend_activation_url = "";
         g_backend_setup_push_url = "";
         Serial.println("[Config] Cloud requests disabled. Set both the HTTPS origin and CA certificate.");
         return;
@@ -973,6 +1009,8 @@ void rebuildUrls() {
     g_backend_readings_url = origin + "/api/v1/readings/";
     g_backend_captures_url = origin + "/api/v1/captures/";
     g_backend_config_url = use_tls ? origin + "/api/v1/devices/config/" : "";
+    g_backend_provisioning_url = use_tls ? origin + "/api/v1/devices/provisioning/" : "";
+    g_backend_activation_url = use_tls ? origin + "/api/v1/devices/activation/" : "";
     g_backend_setup_push_url = use_tls ? origin + "/api/v1/devices/setup-test-push/" : "";
 }
 
@@ -1008,25 +1046,41 @@ void loadRemoteSettings() {
     if (!deserializeJson(doc, cached)
         && strcmp(doc["_origin"] | "", CLOUD_HTTPS_ORIGIN) == 0
         && parseRemoteSettings(doc.as<JsonObjectConst>(), g_device_id, settings)) {
-        g_remote_settings = settings;
+        storeOwnerSettings(settings);
+        g_owner_active.store(strcmp(settings.activationState, "active") == 0);
+        g_activation_ack_requested = strcmp(settings.activationState, "pending") == 0;
         applyCameraSetting();
     }
 }
 
-void fetchRemoteSettings(void*) {
+void fetchRemoteSettings(void* parameter) {
+    const ConfigFetchRequest request = *static_cast<ConfigFetchRequest*>(parameter);
+    delete static_cast<ConfigFetchRequest*>(parameter);
     ConfigDownload result = {};
+    strlcpy(result.pairingCode, request.pairingCode, sizeof(result.pairingCode));
     {
         WiFiClientSecure client;
         HTTPClient http;
         http.useHTTP10(true);
-        if (beginBackendRequest(http, client, g_backend_config_url)) {
+        const String url = request.acknowledge ? g_backend_activation_url : g_backend_provisioning_url;
+        if (beginBackendRequest(http, client, url)) {
             http.addHeader("X-Device-Id", g_device_id);
             http.addHeader("X-Device-Key", g_device_key);
-            if (http.GET() == 200 && http.getSize() > 0 && http.getSize() <= 1024) {
+            if (request.acknowledge || request.publishPairing) {
+                JsonDocument body;
+                if (request.acknowledge) {
+                    body["config_version"] = request.version;
+                    body["activation_generation"] = request.generation;
+                } else body["pairing_code"] = request.pairingCode;
+                String encoded;
+                serializeJson(body, encoded);
+                http.addHeader("Content-Type", "application/json");
+                result.statusCode = http.POST(encoded);
+                result.pairingPublished = request.publishPairing && result.statusCode == 200;
+            } else result.statusCode = http.GET();
+            if (result.statusCode == 200 && http.getSize() > 0 && http.getSize() <= 2048) {
                 const String body = http.getString();
-                if (body.length() == static_cast<size_t>(http.getSize())) {
-                    body.toCharArray(result.body, sizeof(result.body));
-                }
+                if (body.length() == static_cast<size_t>(http.getSize())) body.toCharArray(result.body, sizeof(result.body));
             }
             http.end();
         }
@@ -1036,36 +1090,56 @@ void fetchRemoteSettings(void*) {
 }
 
 void pollRemoteSettings() {
-    if (!g_backend_config_url.length()) return;
+    if (!g_backend_provisioning_url.length()) return;
     if (g_config_downloads == nullptr) g_config_downloads = xQueueCreate(1, sizeof(ConfigDownload));
     if (g_config_downloads == nullptr) return;
-
     ConfigDownload download;
     if (xQueueReceive(g_config_downloads, &download, 0) == pdTRUE) {
         g_config_fetch_running = false;
+        if (download.pairingPublished && strcmp(download.pairingCode, g_pairing_code) == 0) {
+            g_pairing_publish_pending = false;
+            g_pairing_started_ms = millis();
+        }
+        if (download.statusCode == 401 || download.statusCode == 403) {
+            // Explicit server refusal differs from an offline/network failure.
+            g_owner_active.store(false);
+            RemoteSettings refused;
+            copyOwnerSettings(refused);
+            strlcpy(refused.activationState, "unclaimed", sizeof(refused.activationState));
+            refused.smsRecipient[0] = 0;
+            storeOwnerSettings(refused);
+            g_activation_ack_requested = false;
+            if (preferences.begin("preventa", false)) { preferences.remove("remote_cfg"); preferences.end(); }
+        }
+        if (download.statusCode == 409) { g_activation_ack_requested = false; g_pairing_publish_pending = false; }
         JsonDocument doc;
         RemoteSettings settings;
         if (download.body[0] && !deserializeJson(doc, download.body)
-            && parseRemoteSettings(doc.as<JsonObjectConst>(), g_device_id, settings)
-            && strcmp(g_remote_settings.version, settings.version) != 0) {
+                && parseRemoteSettings(doc.as<JsonObjectConst>(), g_device_id, settings)) {
             doc["_origin"] = CLOUD_HTTPS_ORIGIN;
             String cached;
             serializeJson(doc, cached);
+            bool saved = false;
             if (preferences.begin("preventa", false)) {
-                const bool saved = preferences.putString("remote_cfg", cached) == cached.length();
+                saved = preferences.putString("remote_cfg", cached) == cached.length();
                 preferences.end();
-                if (saved) {
-                    const bool camera_changed = settings.cameraEnabled != g_remote_settings.cameraEnabled;
-                    g_remote_settings = settings;
-                    if (camera_changed) applyCameraSetting();
+            }
+            if (saved) {
+                const bool changed = strcmp(g_remote_settings.version, settings.version) != 0;
+                const bool previously_active = g_owner_active.load();
+                const bool camera_changed = settings.cameraEnabled != g_remote_settings.cameraEnabled;
+                storeOwnerSettings(settings);
+                g_owner_active.store(strcmp(settings.activationState, "active") == 0);
+                g_activation_ack_requested = strcmp(settings.activationState, "pending") == 0;
+                if (camera_changed) applyCameraSetting();
+                if (changed || previously_active != g_owner_active.load()) {
                     g_last_uploaded_tier = -1;
-                    Serial.println("[Config] Remote settings applied.");
+                    Serial.printf("[Owner] State: %s | Location: %s\n", settings.activationState, settings.location);
                 }
             }
         }
     }
-
-    const bool connected = WiFi.status() == WL_CONNECTED && !g_portal_active;
+    const bool connected = WiFi.status() == WL_CONNECTED;
     const bool reconnected = connected && !g_config_connected;
     if (reconnected) {
         configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVER1, NTP_SERVER2);
@@ -1073,26 +1147,41 @@ void pollRemoteSettings() {
     }
     g_config_connected = connected;
     if (!connected || g_config_fetch_running || time(nullptr) < 1704067200) return;
-    if (millis() - g_last_config_fetch_ms < 60000UL) return;
+    const unsigned long interval = g_owner_active.load() ? 60000UL : 5000UL;
+    if (millis() - g_last_config_fetch_ms < interval) return;
+    auto* request = new ConfigFetchRequest;
+    if (!request) return;
+    request->acknowledge = g_activation_ack_requested;
+    request->publishPairing = !request->acknowledge && g_pairing_publish_pending
+        && preventa::pairingWindowOpen(millis(), g_pairing_started_ms);
+    strlcpy(request->pairingCode, g_pairing_code, sizeof(request->pairingCode));
+    strlcpy(request->version, g_remote_settings.version, sizeof(request->version));
+    strlcpy(request->generation, g_remote_settings.activationGeneration, sizeof(request->generation));
     g_last_config_fetch_ms = millis();
-    g_config_fetch_running = xTaskCreate(fetchRemoteSettings, "preventa-config", 12288, nullptr, 1, nullptr) == pdPASS;
+    g_config_fetch_running = xTaskCreate(fetchRemoteSettings, "preventa-config", 14336, request, 1, nullptr) == pdPASS;
+    if (!g_config_fetch_running) delete request;
 }
 
 const char* smsRecipient() {
-    return g_remote_settings.version[0] ? g_remote_settings.smsRecipient : SMS_RECIPIENT;
+    return g_owner_active.load() ? g_remote_settings.smsRecipient : "";
 }
 
 const char* testSmsRecipient() {
-    const char* configured = smsRecipient();
-    return configured[0] ? configured : SMS_RECIPIENT;
+    return smsRecipient();
 }
 
 void startCaptivePortal() {
     if (g_portal_active) return;
-    Serial.println("\n[Portal] Starting SoftAP Captive Portal: 'PREVENTA-Setup'...");
+    if (!g_owner_active.load()) {
+        snprintf(g_pairing_code, sizeof(g_pairing_code), "%06lu", (unsigned long)(esp_random() % 1000000UL));
+        g_pairing_started_ms = millis();
+        g_pairing_publish_pending = true;
+        g_last_config_fetch_ms = millis() - 60000UL;
+    }
+    Serial.printf("\n[Portal] Starting protected setup AP: '%s'...\n", AP_SSID);
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAPConfig(apIP, apIP, netMsk);
-    WiFi.softAP(AP_SSID);
+    WiFi.softAP(AP_SSID, PREVENTA_SETUP_PASSWORD);
 
     if (WiFi.status() != WL_CONNECTED && g_wifi_ssid[0]) {
         WiFi.begin(g_wifi_ssid, g_wifi_pass);
@@ -1101,7 +1190,7 @@ void startCaptivePortal() {
 
     g_portal_active = true;
     g_portal_start_ms = millis();
-    Serial.println("[Portal] Connect phone/laptop to Wi-Fi: 'PREVENTA-Setup' -> Navigate to http://192.168.4.1");
+    Serial.printf("[Portal] Connect to '%s' -> Open http://192.168.4.1\n", AP_SSID);
 }
 
 void stopCaptivePortal() {
@@ -1201,6 +1290,7 @@ void setupWebServer() {
 "<div class='wrap'>"
 "<h2>🔥 PREVENTA Setup</h2>"
 "<div class='sub'>IoT Fire Detection Appliance Management</div>"
+"<div class='card'><h3>Owner activation</h3><p id='owner_state'>Checking device state...</p><p>Device: <strong id='owner_device'></strong></p><p>Location: <span id='owner_location'>Not set</span></p><p>Pairing code: <strong id='owner_pin'></strong> <span id='owner_pin_time'></span></p><button type='button' class='btn btn-sec' onclick='renewPairing(this)'>New pairing code</button><p>Save home Wi-Fi first. Note the code, reconnect your phone to the internet, then open owner setup and scan the activation card.</p><a href='https://preventa.duckdns.org/setup/' target='_blank' rel='noreferrer' style='color:#ffaaaa'>Open secure owner setup</a><p>Local monitoring stays active. SMS and cloud alerts require completed activation.</p></div>"
 
 // 1. Wi-Fi Provisioning Card (Device ID, Key, Host locked / hidden)
 "<div class='card'>"
@@ -1314,6 +1404,11 @@ void setupWebServer() {
 "document.getElementById('v_temp').innerText=d.temp_c.toFixed(1);"
 "document.getElementById('v_hum').innerText=d.humidity.toFixed(0);"
 "document.getElementById('v_tier').innerText='T' + d.tier;"
+"document.getElementById('owner_state').textContent=d.activation_state==='active'?'Activated. Local and remote features enabled.':d.activation_state==='pending'?'Linked to an owner. Waiting for synchronization.':'Local monitoring active. Owner setup incomplete.';"
+"document.getElementById('owner_device').textContent=d.device_id||'';"
+"document.getElementById('owner_location').textContent=d.location||'Not set';"
+"document.getElementById('owner_pin').textContent=d.pairing_code||'Not available';"
+"document.getElementById('owner_pin_time').textContent=d.pairing_remaining_sec?'('+d.pairing_remaining_sec+'s remaining)':'';"
 "document.getElementById('v_hush').innerText=d.buzzer_hushed?'Buzzer hushed: '+d.hush_remaining_sec+'s remaining. Monitoring and protection active.':(d.buzzer_active?'Buzzer sounding.':'Buzzer idle.');"
 "document.getElementById('v_cam').innerText='Camera Link: ' + (d.cam_link?'ONLINE':'DISCONNECTED');"
 "document.getElementById('baseline_stat').innerText=d.baseline_samples < d.baseline_target?'Collecting baseline: '+d.baseline_samples+' / '+d.baseline_target:'Sensor baselines ready.';"
@@ -1334,6 +1429,7 @@ void setupWebServer() {
 "document.getElementById('tier_delivery').innerText=d.test_sms==='idle'&&d.test_push==='idle'?'':'Test SMS: '+setupResult[d.test_sms]+' | Test push: '+setupResult[d.test_push];"
 "}).catch(e=>{});}"
 "setInterval(updateTelemetry,2000);updateTelemetry();"
+"function renewPairing(button){button.disabled=true;fetch('/api/pairing',{method:'POST',headers:{'X-Preventa-Setup':'1'}}).then(r=>r.json()).then(d=>{showMsg('tier_msg',d.message,d.status==='ok'?'#37474f':'#d32f2f');updateTelemetry();}).catch(()=>{}).finally(()=>{button.disabled=false;});}"
 "function calibrateBaseline(button){"
 "if(!confirm('Start baseline calibration in clean air with the monitored outlet unloaded?'))return;"
 "button.disabled=true;fetch('/api/cmd?c=calibrate',{method:'POST'}).then(r=>r.json()).then(d=>{"
@@ -1399,8 +1495,29 @@ void setupWebServer() {
         stopCaptivePortal();
     });
 
+    webServer.on("/api/pairing", HTTP_POST, []() {
+        if (webServer.header("X-Preventa-Setup") != "1" || g_owner_active.load()
+                || strcmp(g_remote_settings.activationState, "pending") == 0) {
+            webServer.send(409, "application/json", "{\"status\":\"error\",\"message\":\"Pairing is only available for an unclaimed device in setup mode.\"}");
+            return;
+        }
+        snprintf(g_pairing_code, sizeof(g_pairing_code), "%06lu", (unsigned long)(esp_random() % 1000000UL));
+        g_pairing_started_ms = millis();
+        g_pairing_publish_pending = true;
+        g_last_config_fetch_ms = millis() - 60000UL;
+        webServer.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"New pairing code generated. It will be published when home Wi-Fi connects.\"}");
+    });
+
     webServer.on("/api/status", HTTP_GET, []() {
+        auto quote = [](const char* value) { JsonDocument quoted; quoted.set(value); String result; serializeJson(quoted, result); return result; };
         String json = "{";
+        json += "\"device_id\":" + quote(g_device_id) + ",";
+        json += "\"activation_state\":" + quote(g_remote_settings.activationState) + ",";
+        json += "\"location\":" + quote(g_remote_settings.location) + ",";
+        const bool pairing_open = !g_owner_active.load() && g_pairing_code[0]
+            && preventa::pairingWindowOpen(millis(), g_pairing_started_ms);
+        json += "\"pairing_code\":" + quote(pairing_open ? g_pairing_code : "") + ",";
+        json += "\"pairing_remaining_sec\":" + String(pairing_open ? (preventa::pairingDurationMs - (millis() - g_pairing_started_ms)) / 1000UL : 0) + ",";
         json += "\"mq7_ppm\":" + String(g_ui_mq7_ppm, 1) + ",";
         json += "\"temp_c\":" + String(g_ui_temp, 1) + ",";
         json += "\"humidity\":" + String(g_ui_hum, 1) + ",";
@@ -2521,7 +2638,7 @@ bool sendReadingToBackend(SmoothedData& s, DerivedData& d, SensorStates& st,
                            FusionData& f, CameraDecision& cd, int initial_tier,
                            int final_tier, ResponseData& r) {
 
-    if (WiFi.status() != WL_CONNECTED || g_portal_active) return false;
+    if (!g_owner_active.load() || WiFi.status() != WL_CONNECTED || g_portal_active) return false;
 
     if (millis() < g_backend_backoff_until_ms) return false;
 
@@ -2608,7 +2725,7 @@ bool sendReadingToBackend(SmoothedData& s, DerivedData& d, SensorStates& st,
 }
 
 bool postReadingPayloadToBackend(const String& payload, int final_tier) {
-    if (WiFi.status() != WL_CONNECTED || g_portal_active) return false;
+    if (!g_owner_active.load() || WiFi.status() != WL_CONNECTED || g_portal_active) return false;
     if (millis() < g_backend_backoff_until_ms) return false;
 
     WiFiClientSecure client;
@@ -2649,6 +2766,7 @@ void flushDeferredReadingToBackend() {
 }
 
 bool uploadCaptureToBackend(const uint8_t* jpeg, size_t len, float confidence) {
+    if (!g_owner_active.load()) return false;
     if (!g_remote_settings.cameraEnabled) return false;
     if (WiFi.status() != WL_CONNECTED || g_portal_active) {
         Serial.println("[Capture] WiFi not connected or portal active — skipping capture upload.");
@@ -2867,6 +2985,7 @@ bool runModemDiagnostics() {
 }
 
 void sendModemTestSMS() {
+    if (!g_owner_active.load()) { Serial.println("[Owner] Activate the device before sending SMS tests."); return; }
     Serial.println("[MODEM] Running status checks before the test SMS...");
     if (!runModemDiagnostics()) {
         Serial.println("[MODEM] Test SMS skipped because the modem check did not complete.");
@@ -2888,6 +3007,7 @@ bool trySendSMS(const char* number, const char* message) {
 }
 
 bool sendSmsOnModem(const char* number, const char* message) {
+    if (!g_owner_active.load() || !validSmsNumber(number)) return false;
     if (!probeModemBaud()) return false;
     if (sendModemCommand("AT", "OK", 1500).indexOf("OK") < 0) {
         Serial.println("[MODEM] AT handshake failed before SMS.");
@@ -2937,7 +3057,10 @@ bool queueSmsAlert(int final_tier) {
     if (!g_sms_alerts || !validSmsNumber(recipient)) return false;
     SmsAlert alert = {};
     memcpy(alert.recipient, recipient, strlen(recipient) + 1);
-    alert.message = SMS_ALERT_BODIES[final_tier - SMS_ALERT_TIER];
+    if (!g_owner_active.load()) return false;
+    strlcpy(alert.generation, g_remote_settings.activationGeneration, sizeof(alert.generation));
+    preventa::formatOwnerSms(alert.message, sizeof(alert.message), final_tier,
+                            g_remote_settings.location, g_device_id, false);
     // Keep the newest alert waiting if the modem is already sending a message.
     return xQueueOverwrite(g_sms_alerts, &alert) == pdPASS;
 }
@@ -2947,7 +3070,11 @@ void deliverSmsAlerts(void*) {
         SmsAlert alert;
         if (xQueueReceive(g_sms_alerts, &alert, portMAX_DELAY) != pdTRUE) continue;
         if (xSemaphoreTake(g_modem_lock, portMAX_DELAY) == pdTRUE) {
-            const bool sent = sendSmsOnModem(alert.recipient, alert.message);
+            RemoteSettings current;
+            copyOwnerSettings(current);
+            const bool same_owner = g_owner_active.load()
+                && strcmp(alert.generation, current.activationGeneration) == 0;
+            const bool sent = same_owner && sendSmsOnModem(alert.recipient, alert.message);
             xSemaphoreGive(g_modem_lock);
             if (!sent) Serial.println("[MODEM] Automatic SMS submission failed.");
         }
@@ -2963,11 +3090,13 @@ const char* setupResultName(SetupResult result) {
         case SetupResult::NoBrowser: return "no_browser";
         case SetupResult::RateLimited: return "rate_limited";
         case SetupResult::Idle: return "idle";
+        case SetupResult::NotActivated: return "not_activated";
     }
     return "failed";
 }
 
 SetupResult sendSetupTestPush(int tier) {
+    if (!g_owner_active.load()) return SetupResult::NotActivated;
     if (WiFi.status() != WL_CONNECTED || g_backend_setup_push_url.isEmpty()) return SetupResult::Offline;
     WiFiClientSecure client;
     HTTPClient http;
@@ -2987,14 +3116,22 @@ SetupResult sendSetupTestPush(int tier) {
 }
 
 void sendSetupTestAlerts(void* parameter) {
+    if (!g_owner_active.load()) {
+        g_setup_push_result.store(SetupResult::NotActivated);
+        g_setup_sms_result.store(SetupResult::NotActivated);
+        g_setup_alert_running.store(false);
+        vTaskDelete(nullptr);
+        return;
+    }
     const int tier = static_cast<int>(reinterpret_cast<uintptr_t>(parameter));
+    RemoteSettings owner;
+    copyOwnerSettings(owner);
     char recipient[17];
-    strlcpy(recipient, testSmsRecipient(), sizeof(recipient));
+    strlcpy(recipient, owner.smsRecipient, sizeof(recipient));
     g_setup_push_result.store(sendSetupTestPush(tier));
 
-    char message[120];
-    snprintf(message, sizeof(message), "PREVENTA TEST | Tier %d: %s. Fire source: N/A. No emergency action is needed.",
-             tier, TIER_NAMES[tier]);
+    char message[161];
+    preventa::formatOwnerSms(message, sizeof(message), tier, owner.location, g_device_id, true);
     const bool accepted = validSmsNumber(recipient) && trySendSMS(recipient, message);
     g_setup_sms_result.store(accepted ? SetupResult::Accepted : SetupResult::Failed);
     g_setup_alert_running.store(false);

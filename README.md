@@ -14,10 +14,10 @@ Open the `.ino` with the same name as its enclosing sketch folder. Both sketches
 ## Private configuration
 
 1. Copy `ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/secrets.example.h` to `secrets.h` in the same folder.
-2. Set the Wi-Fi credentials, registered device ID, matching device API key, and fallback SMS recipient in E.164 format.
+2. Set the pre-provisioned device ID and matching device API key, plus a unique setup AP SSID/password. Leave fallback Wi-Fi and SMS fields blank for first-owner onboarding. The owner supplies the recipient through secure setup.
 3. Leave `secrets.h` untracked; it is ignored by Git. The example file also permits compilation without credentials. Such a build must be configured for your device before normal cloud use.
 4. Review `DEFAULT_BACKEND_HOST` and `BACKEND_PORT` in the main sketch for readings/capture uploads. Remote configuration and setup-test push use the certificate-validated origin in `remote_config.h`.
-5. Existing Wi-Fi/device configuration saved in NVS takes precedence over fallback values. The AP is `PREVENTA-Setup` at `http://192.168.4.1`; hold the GPIO33 button for at least 3 seconds and release to open or close it.
+5. Device identity comes from `secrets.h`. Changing that provisioned identity clears stale Wi-Fi and owner cache once. For the same identity, saved Wi-Fi and activated owner configuration survive upgrades/reboots. Use the AP SSID/password printed on the private setup card, then open `http://192.168.4.1`; hold the GPIO33 button for at least 3 seconds and release to open or close it.
 
 The published source contains no provisioned Wi-Fi password, device API key, personal SMS fallback number, Firebase service account or VPS key. Keep the production backend environment and database separately.
 
@@ -57,3 +57,13 @@ node firmware_tests/ap_capture_preview_test.cjs
 ```
 
 These exercise actual firmware helpers and the embedded AP script: hush timing/escalation/rollover, button policy, output state, fresh camera frame selection, delayed responses, duplicate capture requests, crop/score pairing and missing-preview handling. Compilation and host tests do not replace checking the physical buzzer/button on the device.
+
+## First-owner activation (2026-11-27)
+
+The private per-unit `secrets.h` includes a unique device ID/API key and setup AP SSID/password. The separate activation QR contains a one-time claim code, never the permanent device API key. Keep the private provisioning card/JSON out of Git. Blank fallback Wi-Fi and recipient fields are intentional.
+
+Before activation the normal local sensor pipeline, LEDs, buzzer, camera previews and relay rules remain available. Every SMS path and cloud reading/capture upload is gated until activation. Open the protected AP, note its six-digit pairing code BEFORE saving home Wi-Fi (saving closes the AP), then configure home Wi-Fi. Return the phone to an internet connection, open the activation QR, create/sign in to the owner account and supply room/location and household contact. The device fetches, saves and acknowledges activation; the AP/HTTPS page shows the resulting state.
+
+After activation, the saved configuration permits SMS/local monitoring through a Wi-Fi outage. Explicit server authentication refusal disables cloud/SMS authorization; an ordinary network timeout does not erase an already verified activation. A Wi-Fi reset preserves owner configuration. Flashing a different provisioned device identity clears stale Wi-Fi and owner cache once; firmware upgrades with the same identity keep them. Device identity comes from the provisioned firmware rather than old NVS credential overrides.
+
+SMS includes the alert tier, installed room and hardware ID. AP test messages remain clearly marked TEST. Reopening setup on an unclaimed device generates a fresh pairing code. Room changes are fetched at the normal settings interval after activation. The current release does not implement owner transfer; clearing Wi-Fi is not an ownership-release operation.

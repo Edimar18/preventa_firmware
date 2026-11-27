@@ -42,6 +42,10 @@ emyPxgcYxn/eR44/KJ4EBs+lVDR3veyJm+kXQ99b21/+jh5Xos1AnX5iItreGCc=
 struct RemoteSettings {
     char version[65] = {};
     char smsRecipient[17] = {};
+    char name[81] = {};
+    char location[81] = {};
+    char activationGeneration[37] = {};
+    char activationState[10] = "unclaimed";
     float ppmAdvisory = 50.0f;
     float tempAdvisory = 38.0f;
     float currentAdvisory = 8.0f;
@@ -72,6 +76,17 @@ inline bool readThreshold(JsonVariantConst value, float minimum, float maximum, 
 
 inline bool parseRemoteSettings(JsonObjectConst doc, const char* deviceId, RemoteSettings& setting) {
     if (strcmp(doc["device_id"] | "", deviceId) != 0) return false;
+    const char* state = doc["activation_state"] | "";
+    if (strcmp(state, "unclaimed") && strcmp(state, "pending") && strcmp(state, "active")) return false;
+    const char* generation = doc["activation_generation"] | "";
+    if (strlen(generation) != 36 || strspn(generation, "0123456789abcdef-") != 36) return false;
+    const char* name = doc["name"] | "";
+    const char* location = doc["location"] | "";
+    if (strlen(name) > 80 || strlen(location) > 80) return false;
+    strcpy(setting.activationState, state);
+    strcpy(setting.activationGeneration, generation);
+    strcpy(setting.name, name);
+    strcpy(setting.location, location);
     const char* version = doc["config_version"] | "";
     if (!validVersion(version) || !doc["camera_enabled"].is<bool>()) return false;
     if (!doc.containsKey("sms_recipient")) return false;

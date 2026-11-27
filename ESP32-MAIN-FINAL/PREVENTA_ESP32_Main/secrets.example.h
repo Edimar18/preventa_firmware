@@ -7,3 +7,6 @@
 #define PREVENTA_DEVICE_KEY ""
 // Use E.164 format, for example +<country code><subscriber number>.
 #define PREVENTA_SMS_RECIPIENT ""
+
+#define PREVENTA_SETUP_SSID "PREVENTA-Setup-DEMO"
+#define PREVENTA_SETUP_PASSWORD "CHANGE-ME-SETUP"

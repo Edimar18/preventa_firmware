@@ -1,12 +1,18 @@
 {
-  "source_date": "2026-11-26",
+  "source_date": "2026-11-27",
+  "feature": "first-owner activation and room-aware alerts",
   "private_config_excluded": true,
   "sha256": {
-    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/alarm_hush.h": "0d49eb3d33e13bd744d4652ee12e9331409d32f468fb547ee63138983a6f8535",
-    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/PREVENTA_ESP32_Main.ino": "e8052e45fb008bde4b8f7707e7e58a2183287ffeaa81b4dcef255147f5a0450a",
-    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/remote_config.h": "39dda624e5d39648e961cd9d87352bd1a69bad8b57ad7af123799e5b0f4e598f",
-    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/secrets.example.h": "c42e6e0e3940c3e7a50d3ca6880d86c5dc1f95268859016ac7e9fc26adc15284",
     "ESP32-CAM-FINAL/PREVENTA_ESP32_CAM/PREVENTA_ESP32_CAM.ino": "668855cb646c4f2582a441ca8905b598cd4f49395197f87d1dd6eb74be65aedb",
-    "ESP32-CAM-FINAL/PREVENTA_ESP32_CAM/model.h": "4ddffa60bea3a202a339249fa1422f7b92cfb73c62f741417325db14906a7127"
+    "ESP32-CAM-FINAL/PREVENTA_ESP32_CAM/model.h": "4ddffa60bea3a202a339249fa1422f7b92cfb73c62f741417325db14906a7127",
+    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/PREVENTA_ESP32_Main.ino": "155bb1078dcd29903f385cf88ed76113a24e23c1876bc01f6813ee43b8c938e9",
+    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/alarm_hush.h": "0d49eb3d33e13bd744d4652ee12e9331409d32f468fb547ee63138983a6f8535",
+    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/owner_alerts.h": "2e2ea8a3c8cdf5885b5054095a7cd7247802bacee3d53902582b8b96da3486a6",
+    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/remote_config.h": "0dfcdd7f3fd312ff08ebce31e6e14aaaf11e16bcff976ebe651a193614a59b3c",
+    "ESP32-MAIN-FINAL/PREVENTA_ESP32_Main/secrets.example.h": "d132ad6c9edc3ccd911c233faa003326dd458080668672b944dda04afd87c985",
+    "firmware_tests/ap_capture_preview_test.cjs": "2c949a7ca27608f1296f042040f94c5e6d65676e9785f86ad93ddb08efc9f58f",
+    "firmware_tests/test_alarm_hush.py": "4657f6573e3a6bbfe63c9f33b49f5ef420b9e8954b7e02bce93f4764c0740150",
+    "firmware_tests/test_capture_freshness.py": "6c3034c3d51f5961557ac906e91d7a41832e511ba8abc6169bbca8740c84c366",
+    "firmware_tests/test_owner_activation.py": "9fbba4f762a270a0eec918e0d2a0e37141e9e1587e302dce70375fc7f45e75fc"
   }
 }
